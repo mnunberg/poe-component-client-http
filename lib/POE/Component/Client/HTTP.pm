@@ -6,7 +6,7 @@ package POE::Component::Client::HTTP;
 use strict;
 #use bytes; # for utf8 compatibility
 
-use constant DEBUG      => 0;
+use constant DEBUG      => 1;
 use constant DEBUG_DATA => 0;
 
 use vars qw($VERSION);
@@ -37,6 +37,9 @@ use POE qw(
   Filter::HTTPHead Filter::HTTPChunk
   Component::Client::Keepalive
 );
+
+use POE::Component::SSLify qw(Client_SSLify);
+use POE::Wheel::ReadWrite;
 
 # The Internet Assigned Numbers Authority (IANA) acts as a registry
 # for transfer-coding value tokens. Initially, the registry contains
@@ -141,7 +144,10 @@ sub spawn {
       got_socket_input  => \&_poco_weeble_io_read,
       got_socket_flush  => \&_poco_weeble_io_flushed,
       got_socket_error  => \&_poco_weeble_io_error,
-
+      
+      #SSL CONNECT interface
+      got_ssl_proxy_response => \&_poco_weeble_ssl_proxy_response,
+      
       # I/O timeout.
       got_timeout       => \&_poco_weeble_timeout,
       remove_request    => \&_poco_weeble_remove_request,
@@ -172,6 +178,8 @@ sub _poco_weeble_start {
     timeout => $heap->{factory}->timeout,
     ($heap->{bind_addr} ? (bind_address => $heap->{bind_addr}) : ()),
   ) unless ($heap->{cm});
+  use Carp qw(confess);
+  $kernel->sig(DIE => sub { confess @_ });
 }
 
 # }}} _poco_weeble_start
@@ -274,15 +282,11 @@ sub _poco_weeble_request {
       timeout => $heap->{factory}->timeout()
     );
   }
-
   eval {
     # get a connection from Client::Keepalive
-    #
-    # TODO CONNECT - We must ask PCC::Keepalive to establish an http
-    # socket, not https.  The initial proxy interactin is plaintext?
-
-    $request->[REQ_CONN_ID] = $heap->{cm}->allocate(
-      scheme  => $request->scheme,
+    $heap->{cm}->allocate(
+      #When using an https proxy, our initial connection is always HTTP/cleartext
+      scheme  => ($request->[REQ_USING_PROXY_HTTPS]) ? "http" : $request->scheme,
       addr    => $request->host,
       port    => $request->port,
       context => $request->ID,
@@ -340,17 +344,16 @@ sub _poco_weeble_connect_done {
       FlushedEvent => 'got_socket_flush',
       ErrorEvent   => 'got_socket_error',
     );
-
+    $request->wheel($new_wheel);
     DEBUG and warn "CON: request $request_id uses wheel ", $new_wheel->ID;
 
     # Add the new wheel ID to the lookup table.
     $heap->{wheel_to_request}->{ $new_wheel->ID() } = $request_id;
-
-    $request->[REQ_CONNECTION] = $connection;
+    $heap->{request_to_connection}->{$request_id} = $connection;
 
     # SSLify needs us to call it's function to get the "real" socket
     my $peer_addr;
-    if ( $request->scheme eq 'http' ) {
+    if ( $request->scheme eq 'http' || $request->[REQ_USING_PROXY_HTTPS]) {
       $peer_addr = getpeername($new_wheel->get_input_handle());
     } else {
       my $socket = $new_wheel->get_input_handle();
@@ -374,7 +377,18 @@ sub _poco_weeble_connect_done {
     }
 
     $request->create_timer($heap->{factory}->timeout);
-    $request->send_to_wheel;
+    if ($request->[REQ_USING_PROXY_HTTPS]) {
+      #need to remove the event here (temporarily), we'll restore it once
+      #we have flushed our real request..
+      $request->wheel->event(
+        "FlushedEvent" => undef,
+        "InputEvent" => "got_ssl_proxy_response",
+      );
+      
+      $request->send_https_proxy_CONNECT();
+    } else {
+      $request->send_to_wheel;
+    }
   }
   else {
     DEBUG and warn(
@@ -466,7 +480,6 @@ sub _poco_weeble_timeout {
 
 sub _poco_weeble_io_flushed {
   my ($heap, $wheel_id) = @_[HEAP, ARG0];
-
   # We sent the request.  Now we're looking for a response.  It may be
   # bad to assume we won't get a response until a request has flushed.
   my $request_id = $heap->{wheel_to_request}->{$wheel_id};
@@ -488,7 +501,7 @@ sub _poco_weeble_io_flushed {
     my $buf = eval { $callback->() };
 
     if ( $buf ) {
-      $request->[REQ_CONNECTION]->wheel->put($buf);
+      $request->wheel->put($buf);
 
       # reset the timeout
       # Have to also reset REQ_START_TIME or timer ends early
@@ -669,25 +682,6 @@ sub _poco_weeble_io_read {
     $request->[REQ_RESPONSE] = $input;
     $input->header("X-PCCH-Peer", $request->[REQ_PEERNAME]);
 
-    # TODO CONNECT - If we've got the headers to a CONNECT request,
-    # then we can switch to the actual request.  This is like a faux
-    # redirect where the socket gets reused.
-    #
-    # 1. Switch the socket to SSL.
-    # 2. Switch the request from CONNECT mode to regular mode, using
-    #    the method proposed in PCCH::Request.
-    # 3. Send the original request via PCCH::Request->send_to_wheel().
-    #    This puts the client back into the RS_SENDING state.
-    # 4. Reset any data/state so it appears we never went through
-    #    CONNECT.
-    # 5. Make sure that PCC::Keepalive will discard the socket when
-    #    we're done with it.
-    # 6. Return.  The connection should proceed as normal.
-    #
-    # I think the normal handling for HTTP errors will cover the case
-    # of CONNECT failure.  If not, we can refine the implementation as
-    # needed.
-
     # Some responses are without content by definition
     # FIXME: #12363
     # Make sure we finish even when it isn't one of these, but there
@@ -707,7 +701,7 @@ sub _poco_weeble_io_read {
           DEBUG and warn "I/O: removed request $request_id";
           $old_request->remove_timeout();
           delete $heap->{ext_request_to_int_id}{$old_request->[REQ_HTTP_REQUEST]};
-          $old_request->[REQ_CONNECTION] = undef;
+          delete $heap->{request_to_connection}->{$request_id};
         }
         return;
       }
@@ -746,8 +740,7 @@ sub _poco_weeble_io_read {
           DEBUG and warn "I/O: removed request $request_id";
           delete $heap->{ext_request_to_int_id}{$old_request->[REQ_HTTP_REQUEST]};
           $old_request->remove_timeout();
-          $old_request->[REQ_CONNECTION]->close();
-          $old_request->[REQ_CONNECTION] = undef;
+          _delete_and_close_connection($heap,$request_id);
         }
         return;
       }
@@ -827,6 +820,10 @@ sub _poco_weeble_io_read {
     }
     else {
       my $is_done = $request->add_content ($input);
+      #Probably a better place to put this.. but..
+      if ($request->[REQ_STATE] & RS_WANT_CLOSE) {
+        $heap->{request_to_connection}->{$heap->{ext_request_to_int_id}->{$request}}->close();
+      }
     }
   }
 
@@ -849,6 +846,62 @@ sub _poco_weeble_io_read {
 
 # }}} _poco_weeble_io_read
 
+sub _poco_weeble_ssl_proxy_response {
+  DEBUG and warn "HTTPS PROXY: read handler called";
+  
+  my ($kernel,$heap,$input,$wheel_id) = @_[KERNEL,HEAP,ARG0,ARG1];
+  #Check if we have a '200 Connection established' going here.. if not,
+  #it's some kind of error code.. have that handled...
+  return _poco_weeble_io_read(@_) unless (
+    $input->code == 200 && $input->message =~ /connection established/i);
+  #replace the wheel for SSLify
+  my $req_id = $heap->{wheel_to_request}->{$wheel_id};
+  my $request = $heap->{request}->{$req_id};
+  my $old_wheel = $request->wheel;
+  
+  DEBUG and warn "HTTPS PROXY: Trying SSLification";
+  
+  my $sslified_sock = Client_SSLify($old_wheel->get_input_handle);
+  
+  DEBUG and warn "HTTPS PROXY: SSLification done .. $old_wheel";
+  
+  $old_wheel->event(
+    InputEvent => undef,
+    FlushedEvent => undef,
+  );
+  #Maybe delete the old wheel first?
+  my $input_filter = $old_wheel->get_input_filter;
+  my $output_filter = $old_wheel->get_output_filter;
+  
+  $old_wheel->DESTROY();
+  undef $old_wheel;
+  $request->wheel(undef);
+  
+  DEBUG and warn "HTTPS PROXY: Pacified old wheel";
+    
+  my $new_wheel;
+  eval {
+    $new_wheel = POE::Wheel::ReadWrite->new(
+    InputEvent => 'got_socket_input',
+    FlushedEvent => 'got_socket_flush',
+    ErrorEvent => 'got_socket_error',
+    Handle => $sslified_sock,
+    InputFilter => $input_filter,
+    OutputFilter => $output_filter,
+  );
+  };
+  if ($@) {
+    warn "Got error while creating new wheel $@";
+    die $@;
+  }
+  
+  DEBUG and warn "Created new wheel with SSL socket";
+  
+  $heap->{wheel_to_request}->{$new_wheel->ID} = $req_id;
+  DEBUG and warn "HTTPS PROXY: Socket SSLified.. sending real request...";
+  $request->wheel($new_wheel);
+  $request->send_to_wheel();
+}
 
 #------------------------------------------------------------------------------
 # Generate a hex dump of some input. This is not a POE function.
@@ -925,7 +978,8 @@ sub _finish_request {
     );
   }
 
-  # XXX What does this do?
+  # This unintuitively named function calls the postback - which notifies our
+  # user that the response has been received
   $request->add_eof;
 
   # KeepAlive: added the RS_POSTED flag
@@ -994,6 +1048,14 @@ sub _poco_weeble_cancel {
   );
 }
 
+sub _delete_and_close_connection {
+  my ($heap,$reqid) = @_;
+  return if !defined $heap->{request_to_connection}->{$reqid};
+  $heap->{request_to_connection}->{$reqid}->close();
+  delete $heap->{request_to_connection}->{$reqid};
+  return 1;
+}
+
 sub _internal_cancel {
   my ($heap, $request_id, $code, $message) = @_;
 
@@ -1007,17 +1069,12 @@ sub _internal_cancel {
   if (my $wheel = $request->wheel) {
     my $wheel_id = $wheel->ID;
     DEBUG and warn "CXL: Request $request_id canceling wheel $wheel_id";
-    delete $heap->{wheel_to_request}{$wheel_id};
+    delete $heap->{wheel_to_request}->{$wheel_id};
     $wheel = undef;
   }
-
-  if ($request->[REQ_CONNECTION]) {
-    $request->[REQ_CONNECTION]->close();
-    $request->[REQ_CONNECTION] = undef;
-  }
-  else {
+  if(!_delete_and_close_connection($heap,$request_id)) {
     # Didn't connect yet; inform connection manager to cancel
-    # connection request.
+    # connection request
     $heap->{cm}->deallocate($request_id);
   }
 
@@ -1059,6 +1116,10 @@ __END__
 =head1 NAME
 
 POE::Component::Client::HTTP - a HTTP user-agent component
+
+=head1 VERSION
+
+version 0.910
 
 =head1 SYNOPSIS
 
@@ -1536,6 +1597,8 @@ be connected to a proxy rather than the server itself.
 This feature was added at Doreen Grey's request.  Doreen wanted a
 means to find the remote server's address without having to make an
 additional request.
+
+Patches for IPv6 support are welcome.
 
 =head1 ENVIRONMENT
 
