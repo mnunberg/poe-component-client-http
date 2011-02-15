@@ -493,6 +493,7 @@ sub check_redirect {
 
 sub send_https_proxy_CONNECT {
   my $self = shift;
+  return if $self->[REQ_STATE] & RS_HTTPS_PROXY_CONNECT_SENT;
   my $request_string;
   my $proto = $self->[REQ_HTTP_REQUEST]->protocol();
   my $host_spec = $self->[REQ_HTTP_REQUEST]->header('Host');
@@ -608,6 +609,8 @@ sub scheme {
 
   $self->[REQ_USING_PROXY] ? 'http' : $self->[REQ_HTTP_REQUEST]->uri->scheme;
 }
+
+sub http_request { shift->[REQ_HTTP_REQUEST] }
 
 sub DESTROY {
   my ($self) = @_;
