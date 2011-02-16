@@ -1,6 +1,4 @@
-package POE::Component::Client::HTTP::ConnectionStore;
-sub POE::Kernel::CATCH_EXCEPTIONS () { 0 }
- 
+package POE::Component::Client::HTTP::ConnectionStore; 
 use strict;
 use warnings;
 
@@ -18,7 +16,7 @@ use constant {
   
   _CS_MAX                             => 9,
   
-  DEBUG                               => 1,
+  DEBUG                               => $ENV{POE_HTTP_DEBUG} || 0,
 };
 
 my @HAS_REQUEST_VALUES = (
@@ -122,9 +120,11 @@ sub nuke_wheel {
   $self->_delete_by_value($wheel, \@HAS_WHEEL_VALUES);
   my $connection = $self->[CS_CONNECTION_BY_WHEEL]->{$wheel};
   if (defined $connection) {
-    $connection->close();
+    #DEBUG and warn "CS: Closing associated connection for wheel ". $wheel->ID;
+    #$connection->close();
     $self->_delete_by_value($connection, \@HAS_CONNECTION_VALUES);
   }
+  #$wheel->DESTROY();
 }
 
 sub nuke_request_with_connection {
@@ -142,7 +142,6 @@ sub nuke_request_with_connection {
 
 sub unregister_request {
   my ($self,$request) = @_;
-  warn "$request\n";
   DEBUG and warn
     sprintf("CS: unregistering request ID %d", $request->ID);
   $request->remove_timeout();
@@ -152,7 +151,7 @@ sub unregister_request {
 sub request_by_id {
   my ($self,$id) = @_;
   my $ret = $self->[CS_REQUEST_BY_ID]->{$id};
-  warn "CS: Returning $ret for $id\n";
+  DEBUG and warn "CS: Returning $ret for $id\n";
   return $ret;
 }
 
@@ -199,16 +198,16 @@ sub sslified_wheel_for_int_request {
 
 ################################# END ConnectionStore ##########################
 package POE::Component::Client::HTTP;
-#sub POE::Kernel::CATCH_EXCEPTIONS () { 0 }
 
 # vim: ts=2 sw=2 expandtab
 
 # {{{ INIT
 
 use strict;
+use warnings;
 #use bytes; # for utf8 compatibility
 
-use constant DEBUG      => 1;
+use constant DEBUG      => $ENV{POE_HTTP_DEBUG} || 0;
 use constant DEBUG_DATA => 0;
 
 use vars qw($VERSION);
@@ -393,14 +392,12 @@ sub _poco_weeble_start {
 sub _poco_weeble_stop {
   my $heap = $_[HEAP];
   my @requests = $heap->{cs}->all_requests();
+  DEBUG and warn "STOP: @requests";
   foreach my $request_rec (@requests) {
     $request_rec->remove_timeout();
     $heap->{cs}->unregister_request($request_rec);
   }
-
   DEBUG and warn "Client::HTTP (alias=$heap->{alias}) stopped.";
-  use Carp qw(confess);
-  Carp::confess;
 }
 
 # }}} _poco_weeble_stop
@@ -544,8 +541,8 @@ sub _internal_request_connected_init {
   ##### GET PEER NAME
   my $peer_addr;
   my $sock = $request->wheel->get_input_handle();
-  if (!($request->scheme eq 'http' ||
-        not $request->[REQ_STATE] & RS_HTTPS_PROXY_CONNECT_ESTABLISHED)) {
+  if ($request->scheme eq 'https' ||
+      $request->[REQ_STATE] & RS_HTTPS_PROXY_CONNECT_ESTABLISHED) {
     $sock = SSLify_GetSocket($sock);
   }
   
@@ -786,12 +783,12 @@ sub _poco_weeble_io_error {
   }
   
   my $request_id;
-  DEBUG and warn "I/O: removing request $request_id";
+  DEBUG and warn "I/O: removing request " . $request->ID;;
   eval {
     $request_id = $request->ID;
     $heap->{cs}->nuke_request_with_connection($request);
   };
-  die $@ if $@;
+  die "WHEEL SHUTDOWN: $@" if $@;
   
   DEBUG and warn "I/O: Shut down opened IO objects";
   # Otherwise the remote end simply closed.  If we've got a pending
@@ -805,6 +802,7 @@ sub _poco_weeble_io_error {
   # If there was a non-zero error, then something bad happened.  Post
   # an error response back, if we haven't posted anything before.
   if ($errnum) {
+    DEBUG and warn "I/O: Caught an error...";
     if ($operation eq "connect") {
       $request->connect_error($operation, $errnum, $errstr);
       return;
@@ -1105,7 +1103,7 @@ sub _poco_weeble_ssl_proxy_response {
   my $output_filter = $old_wheel->get_output_filter;
   my $connection = $heap->{cs}->connection_by_request($request);
   
-  $old_wheel->DESTROY();
+  #$old_wheel->DESTROY();
   undef $old_wheel;
   $request->wheel(undef);
   
@@ -1254,8 +1252,10 @@ sub _finish_request {
 
 sub _internal_remove_request {
   my ($request,$cs) = @_;
+  DEBUG and warn "_internal_remove_request called..";
   return if !defined $request;
   $cs->unregister_request($request);
+  DEBUG and warn "unregistered request " . $request->ID;
 }
 
 #{{{ _remove_request
@@ -1270,11 +1270,11 @@ sub _poco_weeble_remove_request {
 # Cancel a single request by HTTP::Request object.
 
 sub _poco_weeble_cancel {
-  my ($kernel, $heap, $request) = @_[KERNEL, HEAP, ARG0];
-  my $request_id = $heap->{ext_request_to_int_id}{$request};
-  return unless defined $request_id;
+  my ($kernel, $heap, $http_request) = @_[KERNEL, HEAP, ARG0];
+  my $request = $heap->{cs}->request_by_http_request($http_request);
+  return unless defined $request;
   _internal_cancel(
-    $heap, $request_id, 408, "Request timed out (request canceled)"
+    $heap, $request->ID, 408, "Request timed out (request canceled)"
   );
 }
 
@@ -1309,7 +1309,6 @@ sub _internal_cancel {
 # Shut down the entire component.
 sub _poco_weeble_shutdown {
   my ($kernel, $heap) = @_[KERNEL, HEAP];
-
   $heap->{is_shut_down} = 1;
 
   foreach my $req ($heap->{cs}->all_requests()) {
@@ -1847,8 +1846,6 @@ distribution.
 
 There is no support for CGI_PROXY or CgiProxy.
 
-Secure HTTP (https) proxying is not supported at this time.
-
 There is no object oriented interface.  See
 L<POE::Component::Client::Keepalive> and
 L<POE::Component::Resolver> for examples of a decent OO interface.
@@ -1884,6 +1881,8 @@ L<http://www.sapo.pt/> was kind enough to support his contributions.
 
 Jeff Bisbee added POD tests and documentation to pass several of them
 to version 0.79.  He's a kwalitee-increasing machine!
+
+M. Nunberg added HTTPS Proxy support.
 
 =head1 BUG TRACKER
 

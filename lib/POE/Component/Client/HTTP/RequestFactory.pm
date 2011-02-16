@@ -20,7 +20,7 @@ use constant FCT_FOLLOWREDIRECTS => 8;
 use constant FCT_TIMEOUT         => 9;
 use constant FCT_HTTPS_PROXY     => 10;
 
-use constant DEBUG               => 1;
+use constant DEBUG               => $ENV{POE_HTTP_DEBUG};
 use constant DEFAULT_BLOCK_SIZE  => 4096;
 
 our $VERSION = "0.895";

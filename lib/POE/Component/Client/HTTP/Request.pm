@@ -26,7 +26,7 @@ BEGIN {
 # Unique request ID, independent of wheel and timer IDs.
 my $request_seq = 0;
 
-use constant DEBUG => 1;
+use constant DEBUG => $ENV{POE_HTTP_DEBUG};
 
 use constant REQ_ID            =>  0;
 use constant REQ_POSTBACK      =>  1;
@@ -196,7 +196,7 @@ sub return_response {
   # if we are. that there's no ARG1 lets the client know we're done
   # with the content in the latter case
   if ($self->[REQ_STATE] & RS_DONE) {
-    DEBUG and warn "done; returning $response for ", $self->[REQ_ID];
+    DEBUG and warn "REQ: done; returning $response for ", $self->[REQ_ID];
     $self->[REQ_POSTBACK]->($self->[REQ_RESPONSE]);
     $self->[REQ_STATE] |= RS_POSTED;
     #warn "state is now ", $self->[REQ_STATE];
