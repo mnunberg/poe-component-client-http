@@ -7,7 +7,7 @@
 use strict;
 use warnings;
 
-sub DEBUG () { 0 };
+sub DEBUG () { 1 };
 
 use Test::More tests => 2;
 use Test::POE::Server::TCP;

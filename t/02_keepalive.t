@@ -134,7 +134,6 @@ sub client_got_response {
   my $request_uri  = $http_request->uri       . ''; # stringify
 
   is($http_response->code, 200, "got OK response code");
-	print $http_response->as_string . "\n";
 
   if (@requests) {
   $kernel->post(weeble => request => got_response => shift @requests);

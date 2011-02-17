@@ -3,20 +3,20 @@ use strict;
 use warnings;
 
 use constant {
-  CS_REQUEST_BY_EXT_REQUEST           => 1,
-  CS_REQUEST_BY_WHEEL_ID              => 2,
-  CS_REQUEST_BY_ID                    => 3,
+  CS_REQUEST_BY_EXT_REQUEST           => 0,
+  CS_REQUEST_BY_WHEEL_ID              => 1,
+  CS_REQUEST_BY_ID                    => 2,
   
-  CS_WHEEL_BY_ID                      => 4,
-  CS_WHEEL_BY_CONNECTION              => 5,
-  CS_WHEEL_BY_SSL_PROXY_HOST_PAIR     => 6,
+  CS_WHEEL_BY_ID                      => 3,
+  CS_WHEEL_BY_CONNECTION              => 4,
+  CS_WHEEL_BY_SSL_PROXY_HOST_PAIR     => 5,
   
-  CS_CONNECTION_BY_REQUEST            => 7,
-  CS_CONNECTION_BY_WHEEL              => 8,
-  
+  CS_CONNECTION_BY_REQUEST            => 6,
+  CS_CONNECTION_BY_WHEEL              => 7,
+  CS_CONNECTION_BY_SSL_PROXY_SOCK     => 8,
   _CS_MAX                             => 9,
   
-  DEBUG                               => $ENV{POE_HTTP_DEBUG} || 0,
+  DEBUG                               => $ENV{POCO_HTTP_DEBUG} || 0,
 };
 
 my @HAS_REQUEST_VALUES = (
@@ -66,8 +66,8 @@ sub _delete_by_value {
   foreach my $i (@$indices) {
     while (1) {
       my %tmp = reverse %{ $self->[$i] };
+      last if (!exists $tmp{$val});
       my $k = delete $tmp{$val};
-      last if (!defined $k);
       delete $self->[$i]->{$k};
     }
   }
@@ -107,6 +107,13 @@ sub register_connparams {
       $self->[CS_WHEEL_BY_SSL_PROXY_HOST_PAIR]->{$k} = $wheel;
       DEBUG and warn
         "CS: Registered persistent wheel id ".$wheel->ID." for ssl proxy key".$k;
+      if (defined $connection) {
+        DEBUG and warn "CS: Deleting old connection references";
+        $self->_delete_by_value($connection, \@HAS_CONNECTION_VALUES);
+        DEBUG and warn "CS: Storing connection object for HTTPS proxy socket";
+        $self->[CS_CONNECTION_BY_SSL_PROXY_SOCK]->{
+          $wheel->get_input_handle} = $connection;
+      }
     }
   }
 }
@@ -120,11 +127,18 @@ sub nuke_wheel {
   $self->_delete_by_value($wheel, \@HAS_WHEEL_VALUES);
   my $connection = $self->[CS_CONNECTION_BY_WHEEL]->{$wheel};
   if (defined $connection) {
-    #DEBUG and warn "CS: Closing associated connection for wheel ". $wheel->ID;
-    #$connection->close();
+    DEBUG and warn "CS: Closing associated connection for wheel ". $wheel->ID;
+    $connection->close();
     $self->_delete_by_value($connection, \@HAS_CONNECTION_VALUES);
   }
-  #$wheel->DESTROY();
+  if (delete $self->[CS_CONNECTION_BY_SSL_PROXY_SOCK]->{$wheel->get_input_handle}) {
+    DEBUG and warn "CS: Deleted referenced connection for wheel " . $wheel->ID;
+  }
+}
+
+sub unregister_wheel {
+  my ($self,$wheel) = @_;
+  $self->_delete_by_value($wheel, \@HAS_WHEEL_VALUES);
 }
 
 sub nuke_request_with_connection {
@@ -136,8 +150,41 @@ sub nuke_request_with_connection {
   
   $wheel = $request->wheel;
   $self->unregister_request($request);
-  $self->nuke_wheel($request->wheel) if $wheel;
-  $request->wheel(undef);
+  $self->nuke_wheel($wheel) if defined $wheel;
+}
+
+sub free_connection_for_request {
+  my ($self, $request) = @_;
+  my $connection = delete $self->[CS_CONNECTION_BY_REQUEST]->{$request};
+
+  #We can sometimes have a request without an associated connection, in which
+  #our CS manages sslified proxy wheels..
+  
+  # If there's a connection, then our socket is not SSLified (otherwise it would
+  # have been dropped. In that case, remove the wheel as well...
+  if ($connection) {
+    my $wheel = $request->wheel;
+    if ($wheel ne $connection->wheel) {
+      die "WHEEL MISMATCH!!!!";
+    }
+    DEBUG and warn sprintf(
+      "CS: Freeing connection with wheel %d", $wheel->ID);
+    $self->_delete_by_value($wheel, \@HAS_WHEEL_VALUES);
+    $self->_delete_by_value($connection, \@HAS_CONNECTION_VALUES);
+    if (DEBUG) {
+      foreach my $i (0.._CS_MAX-1) {
+        my $s = "";
+        while ( my ($k,$v) = each %{$self->[$i]} ) {
+          $s .= " ($k, $v) ";
+        }
+        warn "CS: i=$i: $s" if $s;
+      }
+    }
+    undef $connection;
+    undef $wheel;
+  } else {
+    DEBUG and warn "CS: Couldn't find connection..."
+  }
 }
 
 sub unregister_request {
@@ -146,6 +193,8 @@ sub unregister_request {
     sprintf("CS: unregistering request ID %d", $request->ID);
   $request->remove_timeout();
   $self->_delete_by_value($request, \@HAS_REQUEST_VALUES);
+  $self->free_connection_for_request($request);
+  $request->wheel(undef);
 }
 
 sub request_by_id {
@@ -193,6 +242,7 @@ sub associate_ext_request_with_internal_request {
 sub sslified_wheel_for_int_request {
   my ($self,$request) = @_;
   my $key = get_proxy_ssl_key($request);
+  DEBUG and warn "CS: Got request for key $key";
   return $self->[CS_WHEEL_BY_SSL_PROXY_HOST_PAIR]->{$key};
 }
 
@@ -207,7 +257,7 @@ use strict;
 use warnings;
 #use bytes; # for utf8 compatibility
 
-use constant DEBUG      => $ENV{POE_HTTP_DEBUG} || 0;
+use constant DEBUG      => $ENV{POCO_HTTP_DEBUG} || 0;
 use constant DEBUG_DATA => 0;
 
 use vars qw($VERSION);
@@ -495,12 +545,14 @@ sub _poco_weeble_request {
   if ($request->[REQ_USING_PROXY_HTTPS]) {
     my $wheel = $heap->{cs}->sslified_wheel_for_int_request($request);
     if ($wheel) {
+      DEBUG and warn "SSL PROXY: GOT KEY!!!!";
       $request->wheel($wheel);
       $heap->{cs}->register_connparams(
         request => $request,
         wheel => $wheel,
         sslified => 1
       );
+      DEBUG and warn "\n\n REUSING SSL SOCKET FOR " . $http_request->uri . "\n\n";
       #Simulate the old connected callback..
       # - We don't need a connect stage since we're already connected..
       # Also, Keepalive objects are orphaned (and garbage collected) because
@@ -541,7 +593,7 @@ sub _internal_request_connected_init {
   ##### GET PEER NAME
   my $peer_addr;
   my $sock = $request->wheel->get_input_handle();
-  if ($request->scheme eq 'https' ||
+  if (($request->scheme eq 'https' && !$request->[REQ_USING_PROXY_HTTPS]) ||
       $request->[REQ_STATE] & RS_HTTPS_PROXY_CONNECT_ESTABLISHED) {
     $sock = SSLify_GetSocket($sock);
   }
@@ -562,7 +614,7 @@ sub _internal_request_connected_init {
   else {
     $request->[REQ_PEERNAME] = "error: $!";
   }
-  
+  undef $sock;
   
   #Put the wheels in motion...
   
@@ -715,7 +767,7 @@ sub _poco_weeble_io_flushed {
   # bad to assume we won't get a response until a request has flushed.
   my $request = $heap->{cs}->request_by_wheel_id($wheel_id);
   if (not defined $request) {
-    DEBUG and warn "!!!: unexpectedly undefined request ID";
+    DEBUG and warn "!!!: unexpectedly undefined request ID (wheel id $wheel_id)";
     return;
   }
   my $request_id = $request->ID;
@@ -766,15 +818,13 @@ sub _poco_weeble_io_error {
   );
   # Drop the wheel.
   my $request = $heap->{cs}->request_by_wheel_id($wheel_id);
-  #K or die "!!!: unexpectedly undefined request ID" unless defined $request_id;
-  # There was no corresponding request?  Nothing left to do here.
+  my $wheel = $heap->{cs}->wheel_by_id($wheel_id);
+  
   if (!$request) {
-    my $wheel;
     DEBUG and warn "I/O: Request not found.. trying to nuke wheel manually";
     eval {
-      $wheel = $heap->{cs}->wheel_by_id($wheel_id);
       die "Can't get wheel!" if !defined $wheel;
-      return $heap->{cs}->nuke_wheel($wheel) if $wheel;
+      return $heap->{cs}->nuke_wheel($wheel);
     };
     die $@ if($@);
     
@@ -782,6 +832,7 @@ sub _poco_weeble_io_error {
     return;
   }
   
+  die "WHEEL MISMATCH!!! " if $wheel ne $request->wheel;
   my $request_id;
   DEBUG and warn "I/O: removing request " . $request->ID;;
   eval {
@@ -833,7 +884,7 @@ sub _poco_weeble_io_error {
   # We never received a response.
   if (not defined $request->[REQ_RESPONSE]) {
     # Check for pending data indicating a LF-free HTTP 0.9 response.
-    my $lines = $request->wheel->get_input_filter()->get_pending();
+    my $lines = $wheel->get_input_filter()->get_pending();
     my $text = join '' => @$lines;
     DEBUG and warn "Got ", length($text), " bytes of data without LF.";
 
@@ -951,8 +1002,12 @@ sub _poco_weeble_io_read {
   DEBUG_DATA and warn (ref($input) ? $input->as_string : _hexdump($input));
 
   # TODO - So, which is it?  Return, or die?
-  return unless defined $request;
-  die unless defined $request;
+  if (!defined $request) {
+    DEBUG and warn "I/O: INPUT WITHOUT REQUEST!";
+    #warn (ref($input) ? $input->as_string : _hexdump($input));
+    return;
+  }
+  
   $request_id = $request->ID;
   
   DEBUG and warn(
@@ -1053,6 +1108,7 @@ sub _poco_weeble_io_read {
       $request->add_content ($input);
       #Probably a better place to put this.. but..
       if ($request->[REQ_STATE] & RS_WANT_CLOSE) {
+        DEBUG and warn "I/O: Request told us to close.. proceeding..";
         $heap->{cs}->nuke_request_with_connection($request);
       }
     }
@@ -1090,22 +1146,18 @@ sub _poco_weeble_ssl_proxy_response {
   
   my $request = $heap->{cs}->request_by_wheel_id($wheel_id);
   my $old_wheel = $request->wheel;
-  
+  my $connection = $heap->{cs}->connection_by_request($request);
   DEBUG and warn "HTTPS PROXY: Trying SSLification";
   
   my $sslified_sock = Client_SSLify($old_wheel->get_input_handle);
   
   DEBUG and warn "HTTPS PROXY: SSLification done .. $old_wheel";
-  
-  #Maybe delete the old wheel first?
-  
+    
   my $input_filter = $old_wheel->get_input_filter;
   my $output_filter = $old_wheel->get_output_filter;
-  my $connection = $heap->{cs}->connection_by_request($request);
-  
-  #$old_wheel->DESTROY();
-  undef $old_wheel;
   $request->wheel(undef);
+  $old_wheel->DESTROY();
+  undef $old_wheel;
   
   DEBUG and warn "HTTPS PROXY: Pacified old wheel";
     
@@ -1130,8 +1182,8 @@ sub _poco_weeble_ssl_proxy_response {
   
   $heap->{cs}->register_connparams(
     wheel => $new_wheel,
-    connection => $connection,
     request => $request,
+    connection => $connection,
     sslified => 1,
   );
   

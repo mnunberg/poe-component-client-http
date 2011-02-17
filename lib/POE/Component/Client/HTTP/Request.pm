@@ -26,7 +26,7 @@ BEGIN {
 # Unique request ID, independent of wheel and timer IDs.
 my $request_seq = 0;
 
-use constant DEBUG => $ENV{POE_HTTP_DEBUG};
+use constant DEBUG => $ENV{POCO_HTTP_DEBUG};
 
 use constant REQ_ID            =>  0;
 use constant REQ_POSTBACK      =>  1;
@@ -46,8 +46,7 @@ use constant REQ_START_TIME    => 15;
 use constant REQ_FACTORY       => 16;
 use constant REQ_CONN_ID       => 17; #UNUSED
 use constant REQ_PEERNAME      => 18;
-use constant REQ_ORIG          => 19;
-use constant REQ_USING_PROXY_HTTPS => 20;
+use constant REQ_USING_PROXY_HTTPS => 19;
 
 use constant RS_CONNECT        => 0x001; # establishing a connection
 use constant RS_SENDING        => 0x002; # sending request to server
@@ -119,7 +118,7 @@ sub new {
     @params{qw(Request Postback Progress Factory)};
 
   my $request_id = ++$request_seq;
-  DEBUG and warn "REQ: creating a request ($request_id)";
+  DEBUG and warn "REQ: creating a request ($request_id) " . $http_request->uri;
 
   # Get the host and port from the request object.
   my ($host, $port, $scheme, $using_proxy, $using_proxy_https);
@@ -170,7 +169,6 @@ sub new {
     $factory,           # REQ_FACTORY
     undef,              # REQ_CONN_ID
     undef,              # REQ_PEERNAME
-    undef,              # REQ_ORIG
     $using_proxy_https, # REQ_USING_PROXY_HTTPS
   ];
   
@@ -285,7 +283,7 @@ sub add_content {
 
   my $max = $self->[REQ_FACTORY]->max_response_size();
 
-  DEBUG and warn(
+  DEBUG and defined $max and warn(
     "REQ: request ", $self->ID,
     " received $self->[REQ_OCTETS_GOT] bytes; maximum is $max"
   );
@@ -549,7 +547,7 @@ sub send_to_wheel {
 sub wheel {
   my ($self,$new_wheel) = @_;
 
-  if (defined $new_wheel) {
+  if (@_ == 2) {
     $self->[REQ_WHEEL] = undef;
     $self->[REQ_WHEEL] = $new_wheel;
   }
