@@ -47,6 +47,8 @@ use constant REQ_FACTORY       => 16;
 use constant REQ_CONN_ID       => 17; #UNUSED
 use constant REQ_PEERNAME      => 18;
 use constant REQ_USING_PROXY_HTTPS => 19;
+use constant REQ_SERVER_CERT   => 20;
+
 
 use constant RS_CONNECT        => 0x001; # establishing a connection
 use constant RS_SENDING        => 0x002; # sending request to server
@@ -170,6 +172,7 @@ sub new {
     undef,              # REQ_CONN_ID
     undef,              # REQ_PEERNAME
     $using_proxy_https, # REQ_USING_PROXY_HTTPS
+    undef               # REQ_SERVER_CERT
   ];
   
   bless $self, $class;
@@ -185,7 +188,6 @@ sub return_response {
   DEBUG and warn "in return_response ", sprintf ("0x%02X", $self->[REQ_STATE]);
   return if ($self->[REQ_STATE] & RS_POSTED);
   my $response = $self->[REQ_RESPONSE];
-
   # If we have a cookie jar, have it frob our headers.  LWP rocks!
   $self->[REQ_FACTORY]->frob_cookies ($response);
 
@@ -195,6 +197,9 @@ sub return_response {
   # with the content in the latter case
   if ($self->[REQ_STATE] & RS_DONE) {
     DEBUG and warn "REQ: done; returning $response for ", $self->[REQ_ID];
+    if ($self->server_cert) {
+      $response->header('X-PCCH-Server-Certificate' => $self->server_cert);
+    }
     $self->[REQ_POSTBACK]->($self->[REQ_RESPONSE]);
     $self->[REQ_STATE] |= RS_POSTED;
     #warn "state is now ", $self->[REQ_STATE];
@@ -553,6 +558,14 @@ sub wheel {
   }
   
   return $self->[REQ_WHEEL];
+}
+
+sub server_cert {
+  my ($self,$cert) = @_;
+  if (@_ == 2) {
+    $self->[REQ_SERVER_CERT] = $cert;
+  }
+  return $self->[REQ_SERVER_CERT];
 }
 
 sub error {

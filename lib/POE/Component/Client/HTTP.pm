@@ -289,8 +289,10 @@ use POE qw(
   Component::Client::Keepalive
 );
 
-use POE::Component::SSLify qw(Client_SSLify SSLify_GetSocket);
-use POE::Wheel::ReadWrite;
+use POE::Component::SSLify qw(
+  Client_SSLify SSLify_GetSocket SSLify_GetCTX SSLify_GetSSL);
+use Net::SSLeay qw(dump_peer_certificate);
+use Crypt::OpenSSL::X509;
 
 # The Internet Assigned Numbers Authority (IANA) acts as a registry
 # for transfer-coding value tokens. Initially, the registry contains
@@ -304,6 +306,8 @@ use POE::Wheel::ReadWrite;
 
 # FIXME - Is it okay to be mixing content and transfer encodings in
 # this one table?
+
+our $HDR_CERT_INFO = 1;
 
 my %te_possible_filters = (
   'chunked'  => 'POE::Filter::HTTPChunk',
@@ -771,7 +775,13 @@ sub _poco_weeble_io_flushed {
     return;
   }
   my $request_id = $request->ID;
-
+  if ($HDR_CERT_INFO &&
+      ($request->scheme eq 'https' || $request->[REQ_USING_PROXY_HTTPS])) {
+    my $ssl = SSLify_GetSSL($request->wheel->get_input_handle);
+    my $cert = Net::SSLeay::get_peer_certificate($ssl);
+    $cert = Net::SSLeay::PEM_get_string_X509($cert);
+    $request->server_cert($cert);
+  }
   DEBUG and warn(
     "I/O: wheel $wheel_id (request $request_id) flushed its request..."
   );
