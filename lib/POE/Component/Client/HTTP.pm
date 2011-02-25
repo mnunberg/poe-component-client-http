@@ -390,6 +390,7 @@ sub spawn {
       request                => \&_poco_weeble_request,
       pending_requests_count => \&_poco_weeble_pending_requests_count,
       'shutdown'             => \&_poco_weeble_shutdown,
+      delayed_shutdown       => \&_poco_weeble_delayed_shutdown,
       cancel                 => \&_poco_weeble_cancel,
 
       # Client::Keepalive interface.
@@ -1359,7 +1360,7 @@ sub _internal_cancel {
     $heap->{cs}->nuke_request_with_connection($request);
   } else {
     #otherwise, just block the pairing
-    $heap->{cm}->deallocate($request->ID);
+    $heap->{cm}->deallocate($request_id);
     $heap->{cs}->unregister_request($request);
   }
   
@@ -1389,6 +1390,15 @@ sub _poco_weeble_shutdown {
   $kernel->alias_remove($heap->{alias});
 }
 
+sub _poco_weeble_delayed_shutdown {
+  my ($kernel,$session,$heap,$evtname,$interval) = @_[KERNEL,SESSION,HEAP,STATE,ARG0];
+  $interval ||= 1;
+  if (!_poco_weeble_pending_requests_count($heap)) {
+    $kernel->yield("shutdown")
+  } else {
+    $kernel->alarm($evtname, time() + $interval);
+  }
+}
 1;
 
 __END__
