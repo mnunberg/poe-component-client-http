@@ -585,7 +585,12 @@ sub error {
     . "</BODY>$nl"
     . "</HTML>$nl"
   );
-
+  
+  #Set the protocol here. LWP doesn't set it for us, and when using this as a
+  #backend for a proxy engine, it tends to confuse clients...
+  
+  $r->protocol($self->[REQ_HTTP_REQUEST]->protocol);
+  
   $r->content($m);
   $r->request($self->[REQ_HTTP_REQUEST]);
   $self->[REQ_POSTBACK]->($r);
