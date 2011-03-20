@@ -1,4 +1,7 @@
 package POE::Component::Client::HTTP::Request;
+BEGIN {
+  $POE::Component::Client::HTTP::Request::VERSION = '0.910';
+}
 # vim: ts=2 sw=2 expandtab
 
 use strict;
@@ -23,15 +26,11 @@ BEGIN {
 # Unique request ID, independent of wheel and timer IDs.
 my $request_seq = 0;
 
-use constant DEBUG => 0;
-
-# TODO CONNECT - Add a flag to indicate whether to generate an HTTP
-# CONNECT request for proxying, or to return REQ_HTTP_REQUEST.  Add a
-# method to update that flag.
+use constant DEBUG => $ENV{POCO_HTTP_DEBUG};
 
 use constant REQ_ID            =>  0;
 use constant REQ_POSTBACK      =>  1;
-use constant REQ_CONNECTION    =>  2;
+use constant REQ_WHEEL         =>  2;
 use constant REQ_HTTP_REQUEST  =>  3;
 use constant REQ_STATE         =>  4;
 use constant REQ_RESPONSE      =>  5;
@@ -45,16 +44,23 @@ use constant REQ_PORT          => 13;
 use constant REQ_HISTORY       => 14;
 use constant REQ_START_TIME    => 15;
 use constant REQ_FACTORY       => 16;
-use constant REQ_CONN_ID       => 17;
+use constant REQ_CONN_ID       => 17; #UNUSED
 use constant REQ_PEERNAME      => 18;
+use constant REQ_USING_PROXY_HTTPS => 19;
+use constant REQ_SERVER_CERT   => 20;
 
-use constant RS_CONNECT        => 0x01; # establishing a connection
-use constant RS_SENDING        => 0x02; # sending request to server
-use constant RS_IN_HEAD        => 0x04; # waiting for or receiving headers
-use constant RS_REDIRECTED     => 0x08; # request has been redirected
-use constant RS_IN_CONTENT     => 0x20; # waiting for or receiving content
-use constant RS_DONE           => 0x40; # received full content
-use constant RS_POSTED         => 0x80; # we have posted back a response
+
+use constant RS_CONNECT        => 0x001; # establishing a connection
+use constant RS_SENDING        => 0x002; # sending request to server
+use constant RS_IN_HEAD        => 0x004; # waiting for or receiving headers
+use constant RS_REDIRECTED     => 0x008; # request has been redirected
+use constant RS_IN_CONTENT     => 0x020; # waiting for or receiving content
+use constant RS_DONE           => 0x040; # received full content
+use constant RS_POSTED         => 0x080; # we have posted back a response
+
+use constant RS_HTTPS_PROXY_CONNECT_SENT => 0x100;
+use constant RS_HTTPS_PROXY_CONNECT_ESTABLISHED => 0x200;
+use constant RS_WANT_CLOSE     => 0x400;
 
 sub import {
   my ($class) = shift;
@@ -65,10 +71,11 @@ sub import {
     if ($tag eq ':fields') {
       foreach my $sub (
         qw(
-          REQ_ID REQ_POSTBACK REQ_CONNECTION REQ_HTTP_REQUEST REQ_STATE
+          REQ_ID REQ_POSTBACK REQ_WHEEL REQ_HTTP_REQUEST REQ_STATE
           REQ_RESPONSE REQ_BUFFER REQ_OCTETS_GOT REQ_TIMER
           REQ_PROG_POSTBACK REQ_USING_PROXY REQ_HOST REQ_PORT
           REQ_HISTORY REQ_START_TIME REQ_CONN_ID REQ_PEERNAME
+          REQ_USING_PROXY_HTTPS
         )
       ) {
         no strict 'refs';
@@ -80,7 +87,9 @@ sub import {
       foreach my $sub (
         qw(
           RS_CONNECT RS_SENDING RS_IN_HEAD RS_REDIRECTED
-          RS_IN_CONTENT RS_DONE RS_POSTED
+          RS_IN_CONTENT RS_DONE RS_POSTED RS_HTTPS_PROXY_CONNECT_SENT
+          RS_HTTPS_PROXY_CONNECT_ESTABLISHED
+          RS_WANT_CLOSE
         )
       ) {
         no strict 'refs';
@@ -111,10 +120,10 @@ sub new {
     @params{qw(Request Postback Progress Factory)};
 
   my $request_id = ++$request_seq;
-  DEBUG and warn "REQ: creating a request ($request_id)";
+  DEBUG and warn "REQ: creating a request ($request_id) " . $http_request->uri;
 
   # Get the host and port from the request object.
-  my ($host, $port, $scheme, $using_proxy);
+  my ($host, $port, $scheme, $using_proxy, $using_proxy_https);
 
   eval {
     $host   = $http_request->uri()->host();
@@ -129,25 +138,23 @@ sub new {
     defined $http_request->header('Host') and
     length $http_request->header('Host')
   );
-
-
+  
+  my $proxies;
   if (defined $params{Proxy}) {
-    # This request qualifies for proxying.  Replace the host and port
-    # with the proxy's host and port.  This comes after the Host:
-    # header is set, so it doesn't break the request object.
-    ($host, $port) = @{$params{Proxy}->[rand @{$params{Proxy}}]};
-
     $using_proxy = 1;
+    $proxies = $params{Proxy};
+  } elsif (defined $params{ProxyHttps}) {
+    $using_proxy_https = 1;
+    $proxies = $params{ProxyHttps};
   }
-  else {
-    $using_proxy = 0;
-  }
-
+  
+    ($host,$port) = @{ $proxies->[rand @{$proxies}] } if $proxies;
+  
   # Build the request.
   my $self = [
     $request_id,        # REQ_ID
     $postback,          # REQ_POSTBACK
-    undef,              # REQ_CONNECTION
+    undef,              # REQ_WHEEL
     $http_request,      # REQ_HTTP_REQUEST
     RS_CONNECT,         # REQ_STATE
     undef,              # REQ_RESPONSE
@@ -164,8 +171,15 @@ sub new {
     $factory,           # REQ_FACTORY
     undef,              # REQ_CONN_ID
     undef,              # REQ_PEERNAME
+    $using_proxy_https, # REQ_USING_PROXY_HTTPS
+    undef               # REQ_SERVER_CERT
   ];
-  return bless $self, $class;
+  
+  bless $self, $class;
+}
+
+sub connected {
+  my $self = shift;
 }
 
 sub return_response {
@@ -174,7 +188,6 @@ sub return_response {
   DEBUG and warn "in return_response ", sprintf ("0x%02X", $self->[REQ_STATE]);
   return if ($self->[REQ_STATE] & RS_POSTED);
   my $response = $self->[REQ_RESPONSE];
-
   # If we have a cookie jar, have it frob our headers.  LWP rocks!
   $self->[REQ_FACTORY]->frob_cookies ($response);
 
@@ -183,7 +196,10 @@ sub return_response {
   # if we are. that there's no ARG1 lets the client know we're done
   # with the content in the latter case
   if ($self->[REQ_STATE] & RS_DONE) {
-    DEBUG and warn "done; returning $response for ", $self->[REQ_ID];
+    DEBUG and warn "REQ: done; returning $response for ", $self->[REQ_ID];
+    if ($self->server_cert) {
+      $response->header('X-PCCH-Server-Certificate' => $self->server_cert);
+    }
     $self->[REQ_POSTBACK]->($self->[REQ_RESPONSE]);
     $self->[REQ_STATE] |= RS_POSTED;
     #warn "state is now ", $self->[REQ_STATE];
@@ -272,7 +288,7 @@ sub add_content {
 
   my $max = $self->[REQ_FACTORY]->max_response_size();
 
-  DEBUG and warn(
+  DEBUG and defined $max and warn(
     "REQ: request ", $self->ID,
     " received $self->[REQ_OCTETS_GOT] bytes; maximum is $max"
   );
@@ -285,9 +301,8 @@ sub add_content {
       "Use range requests to retrieve specific amounts of content."
     );
 
-    $self->[REQ_STATE] |= RS_DONE;
+    $self->[REQ_STATE] |= (RS_DONE|RS_WANT_CLOSE);
     $self->[REQ_STATE] &= ~RS_IN_CONTENT;
-    $self->[REQ_CONNECTION]->close();
     return 1;
   }
 
@@ -479,16 +494,30 @@ sub check_redirect {
   return undef;
 }
 
+sub send_https_proxy_CONNECT {
+  my $self = shift;
+  return if $self->[REQ_STATE] & RS_HTTPS_PROXY_CONNECT_SENT;
+  my $request_string;
+  my $proto = $self->[REQ_HTTP_REQUEST]->protocol();
+  my $host_spec = $self->[REQ_HTTP_REQUEST]->header('Host');
+  $request_string = "CONNECT $host_spec $proto\r\n" .
+                    "User-Agent: " . $self->[REQ_FACTORY]->agent() .
+                    "\r\n" .
+                    "\r\n";
+  DEBUG and warn "HTTPS PROXY: Sending $request_string";
+  $self->[REQ_WHEEL]->put($request_string);
+  $self->[REQ_STATE] |= RS_HTTPS_PROXY_CONNECT_SENT;
+}
+
 sub send_to_wheel {
   my ($self) = @_;
-
   $self->[REQ_STATE] = RS_SENDING;
-
+  
   my $http_request = $self->[REQ_HTTP_REQUEST];
-
+  
   # MEXNIX 2002-06-01: Check for proxy.  Request query is a bit
   # different...
-
+  
   my $request_uri;
   if ($self->[REQ_USING_PROXY]) {
     $request_uri = $http_request->uri()->canonical();
@@ -517,24 +546,26 @@ sub send_to_wheel {
     warn "`", '-' x 78, "\n";
   };
 
-  $self->[REQ_CONNECTION]->wheel->put ($request_string);
+  $self->[REQ_WHEEL]->put ($request_string);
 }
 
 sub wheel {
-  my ($self) = @_;
+  my ($self,$new_wheel) = @_;
 
-  # FIXME - We don't support older versions of POE.  Remove this chunk
-  # of code when we're not fixing something else.
-  #
-  #if (defined $new_wheel) {
-  #   Switch wheels.  This is cumbersome, but it works around a bug in
-  #   older versions of POE.
-  #  $self->[REQ_WHEEL] = undef;
-  #  $self->[REQ_WHEEL] = $new_wheel;
-  #}
+  if (@_ == 2) {
+    $self->[REQ_WHEEL] = undef;
+    $self->[REQ_WHEEL] = $new_wheel;
+  }
+  
+  return $self->[REQ_WHEEL];
+}
 
-  return unless $self->[REQ_CONNECTION];
-  return $self->[REQ_CONNECTION]->wheel;
+sub server_cert {
+  my ($self,$cert) = @_;
+  if (@_ == 2) {
+    $self->[REQ_SERVER_CERT] ||= $cert;
+  }
+  return $self->[REQ_SERVER_CERT];
 }
 
 sub error {
@@ -554,7 +585,12 @@ sub error {
     . "</BODY>$nl"
     . "</HTML>$nl"
   );
-
+  
+  #Set the protocol here. LWP doesn't set it for us, and when using this as a
+  #backend for a proxy engine, it tends to confuse clients...
+  
+  $r->protocol($self->[REQ_HTTP_REQUEST]->protocol);
+  
   $r->content($m);
   $r->request($self->[REQ_HTTP_REQUEST]);
   $self->[REQ_POSTBACK]->($r);
@@ -590,10 +626,12 @@ sub scheme {
   $self->[REQ_USING_PROXY] ? 'http' : $self->[REQ_HTTP_REQUEST]->uri->scheme;
 }
 
+sub http_request { shift->[REQ_HTTP_REQUEST] }
+
 sub DESTROY {
   my ($self) = @_;
 
-  delete $self->[REQ_CONNECTION];
+  delete $self->[REQ_WHEEL];
   delete $self->[REQ_FACTORY];
 }
 
@@ -604,6 +642,10 @@ __END__
 =head1 NAME
 
 POE::Component::Client::HTTP::Request - an HTTP request class
+
+=head1 VERSION
+
+version 0.910
 
 =head1 SYNOPSIS
 

@@ -12,7 +12,7 @@ use Socket '$CRLF';
 use HTTP::Request::Common 'GET';
 
 sub POE_ASSERT_DEFAULT () { 1 }
-sub DEBUG ()              { 0 }
+sub DEBUG ()              { 1 }
 
 use Test::More tests => 9;
 
@@ -181,7 +181,7 @@ POE::Session->create(
         # Case 1 redirects to a dead port.  We should get a 400.
         ok(
           ($response->code == 500) || ($response->code == 408),
-          "case 1 redirect to dead server returns 500"
+          "case 1 redirect to dead server returns 500 (got " . $response->code.")"
         );
       }
       elsif ($case->{number} == 2) {

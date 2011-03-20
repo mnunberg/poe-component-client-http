@@ -18,7 +18,9 @@ use constant FCT_NOPROXY         => 6;
 use constant FCT_HTTP_PROXY      => 7;
 use constant FCT_FOLLOWREDIRECTS => 8;
 use constant FCT_TIMEOUT         => 9;
-use constant DEBUG               => 0;
+use constant FCT_HTTPS_PROXY     => 10;
+
+use constant DEBUG               => $ENV{POCO_HTTP_DEBUG};
 use constant DEFAULT_BLOCK_SIZE  => 4096;
 
 =head1 CONSTRUCTOR
@@ -111,17 +113,20 @@ sub new {
   my $from             = delete $params->{From};
   my $no_proxy         = delete $params->{NoProxy};
   my $proxy            = delete $params->{Proxy};
+  my $https_proxy      = delete $params->{ProxyHttps};
   my $follow_redirects = delete $params->{FollowRedirects} || 0;
   my $timeout          = delete $params->{Timeout};
 
   # Process HTTP_PROXY and NO_PROXY environment variables.
 
-  $proxy    = $ENV{HTTP_PROXY} || $ENV{http_proxy} unless defined $proxy;
-  $no_proxy = $ENV{NO_PROXY}   || $ENV{no_proxy}   unless defined $no_proxy;
+  $proxy       = $ENV{HTTP_PROXY} || $ENV{http_proxy} unless defined $proxy;
+  $https_proxy = $ENV{HTTPS_PROXY} || $ENV{https_proxy} unless defined $https_proxy;
+  $no_proxy    = $ENV{NO_PROXY}   || $ENV{no_proxy}   unless defined $no_proxy;
 
   # Translate environment variable formats into internal versions.
 
   $class->parse_proxy($proxy) if defined $proxy;
+  $class->parse_proxy($https_proxy) if defined ($https_proxy);
 
   if (defined $no_proxy) {
     unless (ref($no_proxy) eq 'ARRAY') {
@@ -142,6 +147,7 @@ sub new {
     $proxy,            # FCT_HTTP_PROXY
     $follow_redirects, # FCT_FOLLOWREDIRECTS
     $timeout,          # FCT_TIMEOUT
+    $https_proxy       # FCT_HTTPS_PROXY
   ];
 
   return bless $self, $class;
@@ -225,6 +231,7 @@ sub create_request {
     and length $http_request->protocol()
   );
 
+
   # Add the User-Agent: header if one isn't included.
   unless (defined $http_request->user_agent()) {
     $http_request->user_agent($self->agent);
@@ -290,13 +297,13 @@ sub create_request {
   #
   # RCAPUTO 2006-03-23: We only support http proxying right now.
   # Avoid proxying if this isn't an http request.
-
-  # TODO CONNECT - Create a PCCH::Request object in https-CONNECT mode
-  # if we're using https and there's an appropriate proxy.
-
   my $proxy = $proxy_override;
+  my $proxy_https;
+  
   if ($http_request->uri->scheme() eq "http") {
     $proxy ||= $self->[FCT_HTTP_PROXY];
+  } elsif ($http_request->uri->scheme() eq 'https') {
+    $proxy_https = $self->[FCT_HTTPS_PROXY];
   }
 
   if (defined $proxy) {
@@ -314,6 +321,7 @@ sub create_request {
   my $request = POE::Component::Client::HTTP::Request->new (
     Request => $http_request,
     Proxy => $proxy,
+    ProxyHttps => $proxy_https,
     Postback => $postback,
     #Tag => $tag, # TODO - Is this needed for anything?
     Progress => $progress_postback,

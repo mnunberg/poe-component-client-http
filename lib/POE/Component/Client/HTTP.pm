@@ -1,13 +1,18 @@
 package POE::Component::Client::HTTP;
+
 # vim: ts=2 sw=2 expandtab
 
 # {{{ INIT
 
 use strict;
+use warnings;
 #use bytes; # for utf8 compatibility
 
-use constant DEBUG      => 0;
+use constant DEBUG      => $ENV{POCO_HTTP_DEBUG} || 0;
 use constant DEBUG_DATA => 0;
+
+use vars qw($VERSION);
+$VERSION = 0.950;
 
 use Carp qw(croak);
 use HTTP::Response;
@@ -16,6 +21,7 @@ use Socket qw(sockaddr_in inet_ntoa);
 
 use POE::Component::Client::HTTP::RequestFactory;
 use POE::Component::Client::HTTP::Request qw(:states :fields);
+use POE::Component::Client::HTTP::RequestStore;
 
 BEGIN {
   local $SIG{'__DIE__'} = 'DEFAULT';
@@ -35,6 +41,11 @@ use POE qw(
   Component::Client::Keepalive
 );
 
+use POE::Component::SSLify qw(
+  Client_SSLify SSLify_GetSocket SSLify_GetCTX SSLify_GetSSL);
+use Net::SSLeay qw(dump_peer_certificate);
+use Crypt::OpenSSL::X509;
+
 # The Internet Assigned Numbers Authority (IANA) acts as a registry
 # for transfer-coding value tokens. Initially, the registry contains
 # the following tokens: "chunked" (section 3.6.1), "identity" (section
@@ -47,6 +58,8 @@ use POE qw(
 
 # FIXME - Is it okay to be mixing content and transfer encodings in
 # this one table?
+
+our $HDR_CERT_INFO = 1;
 
 my %te_possible_filters = (
   'chunked'  => 'POE::Filter::HTTPChunk',
@@ -129,16 +142,23 @@ sub spawn {
       request                => \&_poco_weeble_request,
       pending_requests_count => \&_poco_weeble_pending_requests_count,
       'shutdown'             => \&_poco_weeble_shutdown,
+      delayed_shutdown       => \&_poco_weeble_delayed_shutdown,
       cancel                 => \&_poco_weeble_cancel,
 
       # Client::Keepalive interface.
+      # TODO: change this to something reflecting the current reality..
+      # e.g. got_io_wheel or io_connected or whatever - since this isn't
+      # the only checkpoint where connections are established anymore
       got_connect_done  => \&_poco_weeble_connect_done,
 
       # ReadWrite interface.
       got_socket_input  => \&_poco_weeble_io_read,
       got_socket_flush  => \&_poco_weeble_io_flushed,
       got_socket_error  => \&_poco_weeble_io_error,
-
+      
+      #SSL CONNECT interface
+      got_ssl_proxy_response => \&_poco_weeble_ssl_proxy_response,
+      
       # I/O timeout.
       got_timeout       => \&_poco_weeble_timeout,
       remove_request    => \&_poco_weeble_remove_request,
@@ -147,6 +167,7 @@ sub spawn {
       alias        => $alias,
       factory      => $request_factory,
       cm           => $cm,
+      rs           => POE::Component::Client::HTTP::RequestStore->new(),
       is_shut_down => 0,
       bind_addr    => $bind_addr,
     },
@@ -177,13 +198,12 @@ sub _poco_weeble_start {
 
 sub _poco_weeble_stop {
   my $heap = $_[HEAP];
-  my $request = delete $heap->{request};
-
-  foreach my $request_rec (values %$request) {
+  my @requests = $heap->{rs}->all_requests();
+  DEBUG and warn "STOP: @requests";
+  foreach my $request_rec (@requests) {
     $request_rec->remove_timeout();
-    delete $heap->{ext_request_to_int_id}->{$request_rec->[REQ_HTTP_REQUEST]};
+    $heap->{rs}->unregister_request($request_rec);
   }
-
   DEBUG and warn "Client::HTTP (alias=$heap->{alias}) stopped.";
 }
 
@@ -192,8 +212,7 @@ sub _poco_weeble_stop {
 
 sub _poco_weeble_pending_requests_count {
   my ($heap) = $_[HEAP];
-  my $r = $heap->{request} || {};
-  return scalar keys %$r;
+  return scalar($heap->{rs}->all_requests);
 }
 
 # }}} _poco_weeble_pending_requests_count
@@ -262,8 +281,14 @@ sub _poco_weeble_request {
     $http_request, $response_event, $tag, $progress_event,
     $proxy_override, $sender
   );
-  $heap->{request}->{$request->ID} = $request;
-  $heap->{ext_request_to_int_id}->{$http_request} = $request->ID;
+  $heap->{rs}->register_request($request, $http_request);
+  my $last_request = $request->[REQ_HISTORY];
+  if ($last_request) {
+    $heap->{rs}->associate_ext_request_with_internal_request(
+      $request,
+      $last_request->[REQ_HTTP_REQUEST]
+    );
+  }
 
   my @timeout;
   if ($heap->{factory}->timeout()) {
@@ -271,29 +296,47 @@ sub _poco_weeble_request {
       timeout => $heap->{factory}->timeout()
     );
   }
-
-  eval {
-    # get a connection from Client::Keepalive
-    #
-    # TODO CONNECT - We must ask PCC::Keepalive to establish an http
-    # socket, not https.  The initial proxy interactin is plaintext?
-
-    $request->[REQ_CONN_ID] = $heap->{cm}->allocate(
-      scheme  => $request->scheme,
-      addr    => $request->host,
-      port    => $request->port,
-      context => $request->ID,
-      event   => 'got_connect_done',
-      @timeout,
-    );
-  };
-  if ($@) {
-    delete $heap->{request}->{$request->ID};
-    delete $heap->{ext_request_to_int_id}->{$http_request};
-
-    # we can reach here for things like host being invalid.
-    $request->error(400, $@);
+  
+  #Do some SSL stuff here.. if we already have a functioning SSL socket,
+  #then we use it here. Otherwise, we proceed as normal..
+  if ($request->[REQ_USING_PROXY_HTTPS]) {
+    my $wheel = $heap->{rs}->sslified_wheel_for_int_request($request);
+    if ($wheel) {
+      DEBUG and warn "SSL PROXY: GOT KEY!!!!";
+      $request->wheel($wheel);
+      $heap->{rs}->register_connparams(
+        request => $request,
+        wheel => $wheel,
+        sslified => 1
+      );
+      DEBUG and warn "\n\n REUSING SSL SOCKET FOR " . $http_request->uri . "\n\n";
+      #Simulate the old connected callback..
+      # - We don't need a connect stage since we're already connected..
+      # Also, Keepalive objects are orphaned (and garbage collected) because
+      # their wheel has been detached.. so this is really a different subsystem
+      # right here.. we need a fix, but meh.
+      return _internal_request_connected_init($heap, $request);
+    }
   }
+  
+  eval {
+      # get a connection from Client::Keepalive
+      $heap->{cm}->allocate(
+        #When using an https proxy, our initial connection is always HTTP/cleartext
+        scheme  => ($request->[REQ_USING_PROXY_HTTPS]) ? "http" : $request->scheme,
+        addr    => $request->host,
+        port    => $request->port,
+        context => $request->ID,
+        event   => 'got_connect_done',
+        @timeout,
+      );
+    };
+    if ($@) {
+      $heap->{rs}->unregister_request($request);
+      
+      # we can reach here for things like host being invalid.
+      $request->error(400, $@);
+    }
 }
 
 # }}} _poco_weeble_request
@@ -301,11 +344,63 @@ sub _poco_weeble_request {
 #------------------------------------------------------------------------------
 # {{{ _poco_weeble_connect_done
 
+sub _internal_request_connected_init {
+  my ($heap,$request) = @_;
+  
+  ##### GET PEER NAME
+  my $peer_addr;
+  my $sock = $request->wheel->get_input_handle();
+  if (($request->scheme eq 'https' && !$request->[REQ_USING_PROXY_HTTPS]) ||
+      $request->[REQ_STATE] & RS_HTTPS_PROXY_CONNECT_ESTABLISHED) {
+    $sock = SSLify_GetSocket($sock);
+  }
+  
+  $peer_addr = getpeername($sock);
+  if (defined $peer_addr) {
+    my ($error, $address, $port) = getnameinfo(
+      $peer_addr, NI_NUMERICHOST | NI_NUMERICSERV
+    );
+
+    if ($error) {
+      $request->[REQ_PEERNAME] = "error: $error";
+    }
+    else {
+      $request->[REQ_PEERNAME] = "$address.$port";
+    }
+  }
+  else {
+    $request->[REQ_PEERNAME] = "error: $!";
+  }
+  undef $sock;
+  
+  #Put the wheels in motion...
+  
+  #Start the timer...
+  $request->create_timer($heap->{factory}->timeout);
+  
+  #Send a CONNECT request for SSL proxy, if needed
+  if ($request->[REQ_USING_PROXY_HTTPS] &&
+      not $request->[REQ_STATE] & RS_HTTPS_PROXY_CONNECT_ESTABLISHED) {
+    #need to remove the event here (temporarily), we'll restore it once
+    #we have flushed our real request..
+    $request->wheel->event(
+      "FlushedEvent" => undef,
+      "InputEvent" => "got_ssl_proxy_response",
+    );
+    
+    $request->send_https_proxy_CONNECT();
+    #Otherwise, send out our real request..
+  } else {
+    $request->send_to_wheel;
+  }
+}
+
 sub _poco_weeble_connect_done {
   my ($heap, $response) = @_[HEAP, ARG0];
 
   my $connection = $response->{'connection'};
   my $request_id = $response->{'context'};
+  my $request = $heap->{rs}->request_by_id($request_id);
 
   # Can't handle connections if we're shut down.
   # TODO - How do we still get these?  Were they previously queued or
@@ -320,7 +415,6 @@ sub _poco_weeble_connect_done {
   if (defined $connection) {
     DEBUG and warn "CON: request $request_id connected ok...";
 
-    my $request = $heap->{request}->{$request_id};
     unless (defined $request) {
       DEBUG and warn "CON: ignoring connection for canceled request";
       return;
@@ -337,42 +431,19 @@ sub _poco_weeble_connect_done {
       FlushedEvent => 'got_socket_flush',
       ErrorEvent   => 'got_socket_error',
     );
-
+    $request->wheel($new_wheel);
     DEBUG and warn "CON: request $request_id uses wheel ", $new_wheel->ID;
 
     # Add the new wheel ID to the lookup table.
-    $heap->{wheel_to_request}->{ $new_wheel->ID() } = $request_id;
-
-    $request->[REQ_CONNECTION] = $connection;
-
-    # SSLify needs us to call it's function to get the "real" socket
-    my $peer_addr;
-    if ( $request->scheme eq 'http' ) {
-      $peer_addr = getpeername($new_wheel->get_input_handle());
-    } else {
-      my $socket = $new_wheel->get_input_handle();
-      $peer_addr = getpeername(POE::Component::SSLify::SSLify_GetSocket($socket));
-    }
-
-    if (defined $peer_addr) {
-      my ($error, $address, $port) = getnameinfo(
-        $peer_addr, NI_NUMERICHOST | NI_NUMERICSERV
-      );
-
-      if ($error) {
-        $request->[REQ_PEERNAME] = "error: $error";
-      }
-      else {
-        $request->[REQ_PEERNAME] = "$address.$port";
-      }
-    }
-    else {
-      $request->[REQ_PEERNAME] = "error: $!";
-    }
-
-    $request->create_timer($heap->{factory}->timeout);
-    $request->send_to_wheel;
+    
+    $heap->{rs}->register_connparams(
+      request => $request,
+      wheel => $request->wheel,
+      connection => $connection,
+    );
+    _internal_request_connected_init($heap,$request);
   }
+  
   else {
     DEBUG and warn(
       "CON: Error connecting for request $request_id --- ", $_[SENDER]->ID
@@ -390,10 +461,7 @@ sub _poco_weeble_connect_done {
     );
 
     DEBUG and warn "I/O: removing request $request_id";
-    my $request = delete $heap->{request}->{$request_id};
-    $request->remove_timeout();
-    delete $heap->{ext_request_to_int_id}->{$request->[REQ_HTTP_REQUEST]};
-
+    $heap->{rs}->unregister_request($request);
     # Post an error response back to the requesting session.
     $request->connect_error($operation, $errnum, $errstr);
   }
@@ -410,7 +478,7 @@ sub _poco_weeble_timeout {
 
   # Discard the request.  Keep a copy for a few bits of cleanup.
   DEBUG and warn "I/O: removing request $request_id";
-  my $request = delete $heap->{request}->{$request_id};
+  my $request = $heap->{rs}->request_by_id($request_id);
 
   unless (defined $request) {
     die(
@@ -419,22 +487,11 @@ sub _poco_weeble_timeout {
       "...",
     );
   }
-
+  
+  $heap->{rs}->nuke_request_with_connection($request);
+  
   DEBUG and warn "T/O: request $request_id has timer ", $request->timer;
-  $request->remove_timeout();
-  delete $heap->{ext_request_to_int_id}->{$request->[REQ_HTTP_REQUEST]};
-
-  # There's a wheel attached to the request.  Shut it down.
-  if (defined(my $wheel = $request->wheel())) {
-    my $wheel_id = $wheel->ID();
-    DEBUG and warn "T/O: request $request_id is wheel $wheel_id";
-
-    # Shut down the connection so it's not reused.
-    $wheel->shutdown_input();
-    delete $heap->{wheel_to_request}->{$wheel_id};
-  }
-
-
+  
   DEBUG and do {
     die( "T/O: request $request_id is unexpectedly zero" )
       unless $request->[REQ_STATE];
@@ -463,20 +520,25 @@ sub _poco_weeble_timeout {
 
 sub _poco_weeble_io_flushed {
   my ($heap, $wheel_id) = @_[HEAP, ARG0];
-
   # We sent the request.  Now we're looking for a response.  It may be
   # bad to assume we won't get a response until a request has flushed.
-  my $request_id = $heap->{wheel_to_request}->{$wheel_id};
-  if (not defined $request_id) {
-    DEBUG and warn "!!!: unexpectedly undefined request ID";
+  my $request = $heap->{rs}->request_by_wheel_id($wheel_id);
+  if (not defined $request) {
+    DEBUG and warn "!!!: unexpectedly undefined request ID (wheel id $wheel_id)";
     return;
   }
-
+  my $request_id = $request->ID;
+  if ($HDR_CERT_INFO &&
+      ($request->scheme eq 'https' || $request->[REQ_USING_PROXY_HTTPS])) {
+    my $ssl = SSLify_GetSSL($request->wheel->get_input_handle);
+    my $cert = Net::SSLeay::get_peer_certificate($ssl);
+    $cert = Net::SSLeay::PEM_get_string_X509($cert);
+    $request->server_cert($cert);
+  }
   DEBUG and warn(
     "I/O: wheel $wheel_id (request $request_id) flushed its request..."
   );
 
-  my $request = $heap->{request}->{$request_id};
 
   # Read content to send from a callback
   if ( ref $request->[REQ_HTTP_REQUEST]->content() eq 'CODE' ) {
@@ -485,7 +547,7 @@ sub _poco_weeble_io_flushed {
     my $buf = eval { $callback->() };
 
     if ( $buf ) {
-      $request->[REQ_CONNECTION]->wheel->put($buf);
+      $request->wheel->put($buf);
 
       # reset the timeout
       # Have to also reset REQ_START_TIME or timer ends early
@@ -517,20 +579,32 @@ sub _poco_weeble_io_error {
   DEBUG and warn(
     "I/O: wheel $wheel_id encountered $operation error $errnum: $errstr"
   );
-
   # Drop the wheel.
-  my $request_id = delete $heap->{wheel_to_request}->{$wheel_id};
-
-  # There was no corresponding request?  Nothing left to do here.
-  # We might have got here because the server sent EOF after we were done processing
-  # the request, and deleted it from our cache. ( notes for RT#50231 )
-  return unless $request_id;
-
-  DEBUG and warn "I/O: removing request $request_id";
-  my $request = delete $heap->{request}->{$request_id};
-  $request->remove_timeout;
-  delete $heap->{ext_request_to_int_id}{$request->[REQ_HTTP_REQUEST]};
-
+  my $request = $heap->{rs}->request_by_wheel_id($wheel_id);
+  my $wheel = $heap->{rs}->wheel_by_id($wheel_id);
+  
+  if (!$request) {
+    DEBUG and warn "I/O: Request not found.. trying to nuke wheel manually";
+    eval {
+      die "Can't get wheel!" if !defined $wheel;
+      return $heap->{rs}->nuke_wheel($wheel);
+    };
+    die $@ if($@);
+    
+    DEBUG and warn "I/O: Wheel shutdown.. done";
+    return;
+  }
+  
+  die "WHEEL MISMATCH!!! " if $wheel ne $request->wheel;
+  my $request_id;
+  DEBUG and warn "I/O: removing request " . $request->ID;;
+  eval {
+    $request_id = $request->ID;
+    $heap->{rs}->nuke_request_with_connection($request);
+  };
+  die "WHEEL SHUTDOWN: $@" if $@;
+  
+  DEBUG and warn "I/O: Shut down opened IO objects";
   # Otherwise the remote end simply closed.  If we've got a pending
   # response, then post it back to the client.
   DEBUG and warn "STATE is ", $request->[REQ_STATE];
@@ -542,6 +616,7 @@ sub _poco_weeble_io_error {
   # If there was a non-zero error, then something bad happened.  Post
   # an error response back, if we haven't posted anything before.
   if ($errnum) {
+    DEBUG and warn "I/O: Caught an error...";
     if ($operation eq "connect") {
       $request->connect_error($operation, $errnum, $errstr);
       return;
@@ -572,7 +647,7 @@ sub _poco_weeble_io_error {
   # We never received a response.
   if (not defined $request->[REQ_RESPONSE]) {
     # Check for pending data indicating a LF-free HTTP 0.9 response.
-    my $lines = $request->wheel->get_input_filter()->get_pending();
+    my $lines = $wheel->get_input_filter()->get_pending();
     my $text = join '' => @$lines;
     DEBUG and warn "Got ", length($text), " bytes of data without LF.";
 
@@ -620,20 +695,94 @@ sub _poco_weeble_io_error {
 # in the other direction.
 # {{{ _poco_weeble_io_read
 
+sub _encoding_to_filter {
+  my $input = shift;  
+  # RFC 2616 14.41:  If multiple encodings have been applied to an
+  # entity, the transfer-codings MUST be listed in the order in
+  # which they were applied.
+
+  my ($filter, @filters);
+
+  # Transfer encoding.
+  
+  my $te = $input->header('Transfer-Encoding');
+  if (defined $te) {
+    my @te = split(/\s*,\s*/, lc($te));
+
+    while (@te and exists $te_filters{$te[-1]}) {
+      my $encoding = pop @te;
+      my $fclass = $te_filters{$encoding};
+      push @filters, $fclass->new();
+    }
+
+    if (@te) {
+      $input->header('Transfer-Encoding', join(', ', @te));
+    }
+    else {
+      $input->header('Transfer-Encoding', undef);
+    }
+  }
+
+  # Content encoding.
+
+  my $ce = $input->header('Content-Encoding');
+  if (defined $ce) {
+    my @ce = split(/\s*,\s*/, lc($ce));
+
+    while (@ce and exists $te_filters{$ce[-1]}) {
+      my $encoding = pop @ce;
+      my $fclass = $te_filters{$encoding};
+      push @filters, $fclass->new();
+    }
+
+    if (@ce) {
+      $input->header('Content-Encoding', join(', ', @ce));
+    }
+    else {
+      $input->header('Content-Encoding', undef);
+    }
+  }
+
+  if (@filters > 1) {
+    $filter = POE::Filter::Stackable->new( Filters => \@filters );
+  }
+  elsif (@filters) {
+    $filter = $filters[0];
+  }
+  else {
+    # Punt if we have no specified filters.
+    $filter = POE::Filter::Stream->new;
+  }
+  return $filter;
+}
+
 sub _poco_weeble_io_read {
   my ($kernel, $heap, $input, $wheel_id) = @_[KERNEL, HEAP, ARG0, ARG1];
-  my $request_id = $heap->{wheel_to_request}->{$wheel_id};
+  my ($request,$request_id);
+  $request = $heap->{rs}->request_by_wheel_id($wheel_id);
 
   DEBUG and warn "I/O: wheel $wheel_id got input...";
   DEBUG_DATA and warn (ref($input) ? $input->as_string : _hexdump($input));
 
+#<<<<<<< HEAD
   # There was no corresponding request?  Nothing left to do here.
   # We might have got here because the server sent EOF after we were done processing
   # the request, and deleted it from our cache. ( notes for RT#50231 )
-  return unless defined $request_id;
-
-  my $request = $heap->{request}->{$request_id};
-  return unless defined $request;
+  # return unless defined $request_id;
+  #
+  #my $request = $heap->{request}->{$request_id};
+  #return unless defined $request;
+#=======
+  # TODO - So, which is it?  Return, or die?
+  if (!defined $request) {
+    DEBUG and warn "I/O: INPUT WITHOUT REQUEST!";
+    #warn (ref($input) ? $input->as_string : _hexdump($input));
+    return;
+  }
+  
+  $request_id = $request->ID;
+  
+#>>>>>>> ssl_proxy
   DEBUG and warn(
     "REQUEST $request_id is $request <" . $request->[REQ_HTTP_REQUEST]->uri . ">"
   );
@@ -653,10 +802,6 @@ sub _poco_weeble_io_read {
   if ($request->[REQ_STATE] & RS_IN_HEAD) {
     if (defined $input) {
       $input->request ($request->[REQ_HTTP_REQUEST]);
-      #warn(
-      #  "INPUT for ", $request->[REQ_HTTP_REQUEST]->uri,
-      #  " is \n",$input->as_string
-      #)
     }
     else {
       #warn "NO INPUT";
@@ -667,25 +812,6 @@ sub _poco_weeble_io_read {
     # include a status line.  See t/53_response_parser.t.
     $request->[REQ_RESPONSE] = $input;
     $input->header("X-PCCH-Peer", $request->[REQ_PEERNAME]);
-
-    # TODO CONNECT - If we've got the headers to a CONNECT request,
-    # then we can switch to the actual request.  This is like a faux
-    # redirect where the socket gets reused.
-    #
-    # 1. Switch the socket to SSL.
-    # 2. Switch the request from CONNECT mode to regular mode, using
-    #    the method proposed in PCCH::Request.
-    # 3. Send the original request via PCCH::Request->send_to_wheel().
-    #    This puts the client back into the RS_SENDING state.
-    # 4. Reset any data/state so it appears we never went through
-    #    CONNECT.
-    # 5. Make sure that PCC::Keepalive will discard the socket when
-    #    we're done with it.
-    # 6. Return.  The connection should proceed as normal.
-    #
-    # I think the normal handling for HTTP errors will cover the case
-    # of CONNECT failure.  If not, we can refine the implementation as
-    # needed.
 
     # Some responses are without content by definition
     # FIXME: #12363
@@ -699,20 +825,17 @@ sub _poco_weeble_io_read {
         and $input->content_length() == 0
       )
     ) {
-      if (_try_redirect($request_id, $input, $request)) {
-        my $old_request = delete $heap->{request}->{$request_id};
-        delete $heap->{wheel_to_request}->{$wheel_id};
-        if (defined $old_request) {
-          DEBUG and warn "I/O: removed request $request_id";
-          $old_request->remove_timeout();
-          delete $heap->{ext_request_to_int_id}{$old_request->[REQ_HTTP_REQUEST]};
-          $old_request->[REQ_CONNECTION] = undef;
-        }
+      if (_try_redirect($request_id, $input, $request, $heap->{rs})) {
         return;
       }
       $request->[REQ_STATE] |= RS_DONE;
-      $request->remove_timeout();
-      _finish_request($heap, $request);
+#<<<<<<< HEAD
+#       $request->remove_timeout();
+#      _finish_request($heap, $request);
+#=======
+#      _finish_request($heap, $request, 1);
+#>>>>>>> ssl_proxy
+	  _finish_request($heap,$request);
       return;
     }
     else {
@@ -738,78 +861,14 @@ sub _poco_weeble_io_read {
       #FIXME: probably want to find out when the content from this
       #       request is in, and only then do the new request, so we
       #       can reuse the connection.
-      if (_try_redirect($request_id, $input, $request)) {
-        my $old_request = delete $heap->{request}->{$request_id};
-        delete $heap->{wheel_to_request}->{$wheel_id};
-        if (defined $old_request) {
-          DEBUG and warn "I/O: removed request $request_id";
-          delete $heap->{ext_request_to_int_id}{$old_request->[REQ_HTTP_REQUEST]};
-          $old_request->remove_timeout();
-          $old_request->[REQ_CONNECTION]->close();
-          $old_request->[REQ_CONNECTION] = undef;
-        }
+      if (_try_redirect($request_id, $input, $request, $heap->{rs})) {
+        $heap->{rs}->nuke_request_with_connection($request);
         return;
       }
-
-      # RFC 2616 14.41:  If multiple encodings have been applied to an
-      # entity, the transfer-codings MUST be listed in the order in
-      # which they were applied.
-
-      my ($filter, @filters);
-
-      # Transfer encoding.
-
-      my $te = $input->header('Transfer-Encoding');
-      if (defined $te) {
-        my @te = split(/\s*,\s*/, lc($te));
-
-        while (@te and exists $te_filters{$te[-1]}) {
-          my $encoding = pop @te;
-          my $fclass = $te_filters{$encoding};
-          push @filters, $fclass->new();
-        }
-
-        if (@te) {
-          $input->header('Transfer-Encoding', join(', ', @te));
-        }
-        else {
-          $input->header('Transfer-Encoding', undef);
-        }
-      }
-
-      # Content encoding.
-
-      my $ce = $input->header('Content-Encoding');
-      if (defined $ce) {
-        my @ce = split(/\s*,\s*/, lc($ce));
-
-        while (@ce and exists $te_filters{$ce[-1]}) {
-          my $encoding = pop @ce;
-          my $fclass = $te_filters{$encoding};
-          push @filters, $fclass->new();
-        }
-
-        if (@ce) {
-          $input->header('Content-Encoding', join(', ', @ce));
-        }
-        else {
-          $input->header('Content-Encoding', undef);
-        }
-      }
-
-      if (@filters > 1) {
-        $filter = POE::Filter::Stackable->new( Filters => \@filters );
-      }
-      elsif (@filters) {
-        $filter = $filters[0];
-      }
-      else {
-        # Punt if we have no specified filters.
-        $filter = POE::Filter::Stream->new;
-      }
-
+      
       # do this last, because it triggers a read
-      $request->wheel->set_input_filter($filter);
+      my $filter = _encoding_to_filter($input);
+      $request->wheel->set_input_filter($filter) if $filter;
     }
     return;
   }
@@ -825,7 +884,12 @@ sub _poco_weeble_io_read {
       # $request->close_connection;
     }
     else {
-      my $is_done = $request->add_content ($input);
+      $request->add_content ($input);
+      #Probably a better place to put this.. but..
+      if ($request->[REQ_STATE] & RS_WANT_CLOSE) {
+        DEBUG and warn "I/O: Request told us to close.. proceeding..";
+        $heap->{rs}->nuke_request_with_connection($request);
+      }
     }
   }
 
@@ -848,6 +912,63 @@ sub _poco_weeble_io_read {
 
 # }}} _poco_weeble_io_read
 
+sub _poco_weeble_ssl_proxy_response {
+  DEBUG and warn "HTTPS PROXY: read handler called";
+  
+  my ($kernel,$heap,$input,$wheel_id) = @_[KERNEL,HEAP,ARG0,ARG1];
+  #Check if we have a '200 Connection established' going here.. if not,
+  #it's some kind of error code.. have that handled...
+  return _poco_weeble_io_read(@_) unless (
+    $input->code == 200 && $input->message =~ /connection established/i);
+  
+  #replace the wheel for SSLify
+  
+  my $request = $heap->{rs}->request_by_wheel_id($wheel_id);
+  my $old_wheel = $request->wheel;
+  my $connection = $heap->{rs}->connection_by_request($request);
+  DEBUG and warn "HTTPS PROXY: Trying SSLification";
+  
+  my $sslified_sock = Client_SSLify($old_wheel->get_input_handle);
+  
+  DEBUG and warn "HTTPS PROXY: SSLification done .. $old_wheel";
+    
+  my $input_filter = $old_wheel->get_input_filter;
+  my $output_filter = $old_wheel->get_output_filter;
+  $request->wheel(undef);
+  $old_wheel->DESTROY();
+  undef $old_wheel;
+  
+  DEBUG and warn "HTTPS PROXY: Pacified old wheel";
+    
+  my $new_wheel;
+  eval {
+    $new_wheel = POE::Wheel::ReadWrite->new(
+    InputEvent => 'got_socket_input',
+    FlushedEvent => 'got_socket_flush',
+    ErrorEvent => 'got_socket_error',
+    Handle => $sslified_sock,
+    InputFilter => $input_filter,
+    OutputFilter => $output_filter,
+  );
+  };
+  if ($@) {
+    warn "Got error while creating new wheel $@";
+    die $@;
+  }
+  
+  DEBUG and warn "Created new wheel with SSL socket";
+  $request->wheel($new_wheel);
+  
+  $heap->{rs}->register_connparams(
+    wheel => $new_wheel,
+    request => $request,
+    connection => $connection,
+    sslified => 1,
+  );
+  
+  DEBUG and warn "HTTPS PROXY: Socket SSLified.. sending real request...";
+  $request->send_to_wheel();
+}
 
 #------------------------------------------------------------------------------
 # Generate a hex dump of some input. This is not a POE function.
@@ -879,7 +1000,7 @@ sub _hexdump {
 # occur, or false if there's no redirect.
 
 sub _try_redirect {
-  my ($request_id, $input, $request) = @_;
+  my ($request_id, $input, $request, $cs) = @_;
 
   if (my $newrequest = $request->check_redirect) {
     DEBUG and warn(
@@ -892,7 +1013,10 @@ sub _try_redirect {
         'http://' .  $request->host .  ':' .  $request->port .  '/'
       );
     }
-
+        
+    #unregister our own request stuff here, since we're done with it..
+    $cs->unregister_request($request);
+    
     $poe_kernel->yield(
       request =>
       $request,
@@ -901,7 +1025,7 @@ sub _try_redirect {
       $request->[REQ_PROG_POSTBACK],
       @proxy
     );
-
+    
     return 1;
   }
 
@@ -924,7 +1048,8 @@ sub _finish_request {
     );
   }
 
-  # XXX What does this do?
+  # This unintuitively named function calls the postback - which notifies our
+  # user that the response has been received
   $request->add_eof;
 
   # KeepAlive: added the RS_POSTED flag
@@ -936,77 +1061,85 @@ sub _finish_request {
   my $address = "$request->[REQ_HOST]:$request->[REQ_PORT]";
 
   DEBUG and warn "address is $address";
-
-  return _clear_req_cache( $heap, $request_id );
+#<<<<<<< HEAD
+#  return _clear_req_cache( $heap, $request_id );
+#=======
+#  if ($wait) {
+#    # Wait a bit with removing the request, so there's time to receive
+#    # the EOF event in case the connection gets closed.
+#    # TODO - Inflates the pending request count.  Why do we do this?
+#    my $alarm_id = $poe_kernel->delay_set('remove_request', 0.5, $request_id);
+#
+#    # remove the old timeout first
+#    DEBUG and warn "delay_set; now remove_timeout()";
+#    $request->remove_timeout();
+#    DEBUG and warn "removed timeout; now timer()";
+#    $request->timer($alarm_id);
+#  }
+#  else {
+#    _internal_remove_request($request, $heap->{rs});
+#  }
+#>>>>>>> ssl_proxy
+  _internal_remove_request($request, $heap->{rs});
 }
 
 # }}} _finish_request
 
+sub _internal_remove_request {
+  my ($request,$cs) = @_;
+  DEBUG and warn "_internal_remove_request called..";
+  return if !defined $request;
+  $cs->unregister_request($request);
+  DEBUG and warn "unregistered request " . $request->ID;
+}
+
 #{{{ _remove_request
 sub _poco_weeble_remove_request {
   my ($kernel, $heap, $request_id) = @_[KERNEL, HEAP, ARG0];
-
-  return _clear_req_cache( $heap, $request_id );
+  my $request = $heap->{rs}->request_by_id($request_id);
+  _internal_remove_request($request, $heap->{rs}) if $request;
 }
+
 #}}} _remove_request
-
-# helper subroutine to remove a request from our caches
-#{{{ _clear_req_cache
-sub _clear_req_cache {
-  my ($heap, $request_id) = @_;
-
-  my $request = delete $heap->{request}->{$request_id};
-  if (defined $request) {
-    DEBUG and warn "I/O: removed request $request_id";
-    $request->remove_timeout();
-    delete $heap->{ext_request_to_int_id}{$request->[REQ_HTTP_REQUEST]};
-    if (my $wheel = $request->wheel) {
-      delete $heap->{wheel_to_request}->{$wheel->ID};
-    }
-  }
-
-  return;
-}
-#}}} _clear_req_cache
 
 # Cancel a single request by HTTP::Request object.
 
 sub _poco_weeble_cancel {
-  my ($kernel, $heap, $request) = @_[KERNEL, HEAP, ARG0];
-  my $request_id = $heap->{ext_request_to_int_id}{$request};
-  return unless defined $request_id;
+  my ($kernel, $heap, $http_request) = @_[KERNEL, HEAP, ARG0];
+  my $request = $heap->{rs}->request_by_http_request($http_request);
+  return unless defined $request;
   _internal_cancel(
-    $heap, $request_id, 408, "Request timed out (request canceled)"
+    $heap, $request->ID, 408, "Request timed out (request canceled)"
   );
+}
+
+sub _delete_and_close_connection {
+  my ($heap,$reqid) = @_;
+  return if !defined $heap->{request_to_connection}->{$reqid};
+  $heap->{request_to_connection}->{$reqid}->close();
+  delete $heap->{request_to_connection}->{$reqid};
+  return 1;
 }
 
 sub _internal_cancel {
   my ($heap, $request_id, $code, $message) = @_;
-
-  my $request = delete $heap->{request}{$request_id};
+  my $request = $heap->{rs}->request_by_id($request_id);
   return unless defined $request;
 
   DEBUG and warn "CXL: canceling request $request_id";
-  $request->remove_timeout();
-  delete $heap->{ext_request_to_int_id}{$request->[REQ_HTTP_REQUEST]};
-
-  if (my $wheel = $request->wheel) {
-    my $wheel_id = $wheel->ID;
-    DEBUG and warn "CXL: Request $request_id canceling wheel $wheel_id";
-    delete $heap->{wheel_to_request}{$wheel_id};
-    $wheel = undef;
+  if ($heap->{rs}->connection_by_request($request)) {
+    #If we're connected already, then the connection is tainted.. close it
+    $heap->{rs}->nuke_request_with_connection($request);
+  } else {
+    #otherwise, just block the pairing
+    eval {
+      $heap->{cm}->deallocate($request_id);
+    }; if ($@) {
+      warn $@;
+    }
+    $heap->{rs}->unregister_request($request);
   }
-
-  if ($request->[REQ_CONNECTION]) {
-    $request->[REQ_CONNECTION]->close();
-    $request->[REQ_CONNECTION] = undef;
-  }
-  else {
-    # Didn't connect yet; inform connection manager to cancel
-    # connection request.
-    $heap->{cm}->deallocate($request_id);
-  }
-
+  
   unless ($request->[REQ_STATE] & RS_POSTED) {
     $request->error($code, $message);
   }
@@ -1015,14 +1148,11 @@ sub _internal_cancel {
 # Shut down the entire component.
 sub _poco_weeble_shutdown {
   my ($kernel, $heap) = @_[KERNEL, HEAP];
-
   $heap->{is_shut_down} = 1;
 
-  my @request_ids = keys %{$heap->{request}};
-  foreach my $request_id (@request_ids) {
-    _internal_cancel(
-      $heap, $request_id, 408, "Request timed out (component shut down)"
-    );
+  foreach my $req ($heap->{rs}->all_requests()) {
+    _internal_cancel($heap, $req->ID, 408,
+                     "Request timed out (component shut down)");
   }
 
   # Shut down the connection manager subcomponent.
@@ -1031,11 +1161,20 @@ sub _poco_weeble_shutdown {
     $heap->{cm}->shutdown();
     delete $heap->{cm};
   }
-
+  
   # Final cleanup of this component.
   $kernel->alias_remove($heap->{alias});
 }
 
+sub _poco_weeble_delayed_shutdown {
+  my ($kernel,$session,$heap,$evtname,$interval) = @_[KERNEL,SESSION,HEAP,STATE,ARG0];
+  $interval ||= 1;
+  if (!_poco_weeble_pending_requests_count($heap)) {
+    $kernel->yield("shutdown")
+  } else {
+    $kernel->alarm($evtname, time() + $interval);
+  }
+}
 1;
 
 __END__
@@ -1045,6 +1184,10 @@ __END__
 =head1 NAME
 
 POE::Component::Client::HTTP - a HTTP user-agent component
+
+=head1 VERSION
+
+version 0.910
 
 =head1 SYNOPSIS
 
@@ -1527,6 +1670,8 @@ This feature was added at Doreen Grey's request.  Doreen wanted a
 means to find the remote server's address without having to make an
 additional request.
 
+Patches for IPv6 support are welcome.
+
 =head1 ENVIRONMENT
 
 POE::Component::Client::HTTP uses two standard environment variables:
@@ -1552,8 +1697,6 @@ distribution.
 =head1 BUGS
 
 There is no support for CGI_PROXY or CgiProxy.
-
-Secure HTTP (https) proxying is not supported at this time.
 
 There is no object oriented interface.  See
 L<POE::Component::Client::Keepalive> and
@@ -1590,6 +1733,8 @@ L<http://www.sapo.pt/> was kind enough to support his contributions.
 
 Jeff Bisbee added POD tests and documentation to pass several of them
 to version 0.79.  He's a kwalitee-increasing machine!
+
+M. Nunberg added HTTPS Proxy support and some other goodies.
 
 =head1 BUG TRACKER
 
