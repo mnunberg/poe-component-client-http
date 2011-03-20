@@ -563,7 +563,7 @@ sub wheel {
 sub server_cert {
   my ($self,$cert) = @_;
   if (@_ == 2) {
-    $self->[REQ_SERVER_CERT] = $cert;
+    $self->[REQ_SERVER_CERT] ||= $cert;
   }
   return $self->[REQ_SERVER_CERT];
 }
